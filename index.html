@@ -492,8 +492,13 @@ const Sync={cfg:lsGet("gema.sync",null),busy:false,again:false,timer:null,applyi
   body(d){return JSON.stringify({files:{[SYNC_FILE]:{content:JSON.stringify({gema:1,saved:new Date().toISOString(),...d},null,0)}}});},
   async connect(token){
     const me=await this.api("/user",{},token);
-    let gist=null;
-    for(let page=1;page<=5&&!gist;page++){const list=await this.api(`/gists?per_page=100&page=${page}`,{},token);if(!list.length)break;gist=list.find(g=>g.files&&g.files[SYNC_FILE]&&/Gema/.test(g.description||""));}
+    let found=[];
+    for(let page=1;page<=5;page++){const list=await this.api(`/gists?per_page=100&page=${page}`,{},token);if(!list.length)break;found=found.concat(list.filter(g=>g.files&&g.files[SYNC_FILE]));}
+    found.sort((a,b)=>String(a.created_at).localeCompare(String(b.created_at)));
+    let gist=found[0];
+    if(found.length>1){ // more than one sync file (e.g. two devices connected at once): fold the extras into this device first
+      for(const g of found.slice(1)){try{const full=await this.api(`/gists/${g.id}`,{},token);const f=full.files[SYNC_FILE];const txt=f.truncated?await (await fetch(f.raw_url,{cache:"no-store"})).text():f.content;
+        const m=mergeData(this.local(),JSON.parse(txt));this.applying=true;Store.decks=m.decks;Store.cards=m.cards;Store.deleted=m.deleted;Store.saveLocal();this.applying=false;}catch(e){this.applying=false;}}}
     if(!gist)gist=await this.api("/gists",{method:"POST",body:JSON.stringify({description:"Gema: daftar belajar (dibuat otomatis oleh aplikasi Gema)",public:false,files:JSON.parse(this.body(this.local())).files})},token);
     this.cfg={token,gist:gist.id,login:me.login};lsSet("gema.sync",this.cfg);
     await this.now(true);return me.login;},
@@ -504,7 +509,14 @@ const Sync={cfg:lsGet("gema.sync",null),busy:false,again:false,timer:null,applyi
   async now(loud){
     if(!this.on)return;if(this.busy){this.again=true;return;}this.busy=true;
     try{const remote=await this.pull();const loc=this.local();const merged=mergeData(loc,remote);
-      if(dataSig(merged)!==dataSig(loc)){this.applying=true;Store.decks=merged.decks;Store.cards=merged.cards;Store.deleted=merged.deleted;Store.saveLocal();this.applying=false;onData();}
+      if(dataSig(merged)!==dataSig(loc)){const had=new Set(loc.decks.map(d=>d.id));
+        this.applying=true;Store.decks=merged.decks;Store.cards=merged.cards;Store.deleted=merged.deleted;Store.saveLocal();this.applying=false;
+        const fresh=merged.decks.filter(d=>!had.has(d.id));
+        if(fresh.length){const count=id=>merged.cards.filter(c=>c.deck===id).length;const cur=merged.decks.find(d=>d.id===SET.deck);
+          if(!cur||count(cur.id)===0){const best=fresh.slice().sort((a,b)=>count(b.id)-count(a.id))[0];SET.deck=best.id;saveSet();st.idx=0;st.qState=null;}
+          toast(`Daftar dari perangkat lain: ${fresh.map(d=>d.name).join(", ")}. Pilih di menu daftar paling atas.`,5000);}
+        onData();}
+      this.stats={decks:merged.decks.length,cards:merged.cards.length};
       if(dataSig(merged)!==dataSig(remote))await this.api(`/gists/${this.cfg.gist}`,{method:"PATCH",body:this.body(merged)});
       this.last=Date.now();this.err="";if(loud)toast("Daftar tersinkron");}
     catch(e){this.applying=false;const st=e&&e.status;this.err=st===401?"Kode akses ditolak atau sudah kedaluwarsa. Hubungkan ulang.":st===404?"File sinkron tidak ditemukan. Hubungkan ulang.":"Belum bisa sinkron (cek internet).";
@@ -512,7 +524,9 @@ const Sync={cfg:lsGet("gema.sync",null),busy:false,again:false,timer:null,applyi
     finally{this.busy=false;const s=$("#syncState");if(s)s.textContent=syncStateText();if(this.again){this.again=false;this.schedule(800);}}
   }
 };
-function syncStateText(){if(!Sync.on)return "";if(Sync.err)return Sync.err;if(!Sync.last)return "Menyinkronkan…";return "Terakhir sinkron "+new Date(Sync.last).toLocaleTimeString("id-ID",{hour:"2-digit",minute:"2-digit"});}
+function syncStateText(){if(!Sync.on)return "";if(Sync.err)return Sync.err;if(!Sync.last)return "Menyinkronkan…";
+  const st2=Sync.stats?` · di GitHub: ${Sync.stats.decks} daftar, ${Sync.stats.cards} item`:"";
+  return "Terakhir sinkron "+new Date(Sync.last).toLocaleTimeString("id-ID",{hour:"2-digit",minute:"2-digit"})+st2+` · kode file ${String(Sync.cfg.gist).slice(0,6)}`;}
 document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")Sync.schedule(300);});
 setInterval(()=>{if(document.visibilityState==="visible")Sync.schedule(0);},90000);
 
@@ -687,7 +701,9 @@ const ASR={pipe:null,loading:null,prog:{},onProg:null,
     const out=await pipe(pcm,{language:wl,task:"transcribe"});return String((out&&out.text)||"").trim();}
 };
 /* one microphone grant per visit: keep the stream open instead of asking every sentence */
-const MIC={stream:null,async get(){if(this.stream&&this.stream.active)return this.stream;this.stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true}});return this.stream;}};
+const IS_MOBILE=/Android|iPhone|iPad|iPod|Mobile|HarmonyOS/i.test(navigator.userAgent);
+const MIC={stream:null,async get(){if(this.stream&&this.stream.active)return this.stream;this.stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true}});return this.stream;},
+  release(){try{this.stream&&this.stream.getTracks().forEach(t=>t.stop());}catch(e){}this.stream=null;}};
 function recordAudio(maxMs){return new Promise(async(res,rej)=>{
   let stream;try{stream=await MIC.get();}catch(e){return rej("not-allowed");}
   let rec;try{rec=new MediaRecorder(stream);}catch(e){return rej("audio-capture");}
@@ -706,20 +722,24 @@ async function whisperListen(lang,onInterim){
   if(!ASR.pipe){onInterim&&onInterim("Menyiapkan pengenal suara (unduhan pertama sekitar 80 MB)…");
     try{await ASR.load(p=>onInterim&&onInterim(`Mengunduh pengenal suara ${p}%`));}catch(e){throw "model";}}
   onInterim&&onInterim("Giliranmu, ucapkan sekarang");
-  const blob=await recordAudio(20000);if(!blob)return [];
+  const blob=await recordAudio(20000);if(IS_MOBILE)MIC.release();if(!blob)return [];
   onInterim&&onInterim("Menilai ucapan…");
   return [await ASR.transcribe(blob,lg.wl)];
 }
 async function listen(tag,onInterim,lang){if(!SR)return whisperListen(lang||curDeck().lang,onInterim);
-  if(!inFrame&&navigator.mediaDevices){try{await MIC.get();}catch(e){throw "not-allowed";}}
+  // Holding the mic open only helps a page opened straight from disk on a computer (Chrome asks every time there).
+  // Everywhere else, and always on phones, the speech recogniser needs the mic to itself.
+  if(location.protocol==="file:"&&!IS_MOBILE&&navigator.mediaDevices){try{await MIC.get();}catch(e){throw "not-allowed";}}
+  else MIC.release();
   return srListen(tag,onInterim);}
 function srListen(tag,onInterim){return new Promise((res,rej)=>{
   const r=new SR();r.lang=tag;r.interimResults=true;r.maxAlternatives=4;r.continuous=false;
-  let alts=[],err=null;listen.cur=r;
-  r.onresult=e=>{let txt="";for(let i=0;i<e.results.length;i++)txt+=e.results[i][0].transcript;onInterim&&onInterim(txt);
+  let alts=[],err=null,interim="";listen.cur=r;
+  r.onresult=e=>{let txt="";for(let i=0;i<e.results.length;i++)txt+=e.results[i][0].transcript;interim=txt;onInterim&&onInterim(txt);
     const last=e.results[e.results.length-1];if(last.isFinal){alts=[];for(let k=0;k<last.length;k++){let pre="";for(let i=0;i<e.results.length-1;i++)pre+=e.results[i][0].transcript;alts.push(pre+last[k].transcript);}}};
+  r.onaudiostart=()=>{onInterim&&onInterim("Giliranmu, ucapkan sekarang");};
   r.onerror=e=>{err=e.error;};
-  r.onend=()=>{listen.cur=null;if(err&&err!=="no-speech"&&err!=="aborted")return rej(err);res(alts);};
+  r.onend=()=>{listen.cur=null;if(!alts.length&&interim)alts=[interim];if(err&&err!=="no-speech"&&err!=="aborted")return rej(err);res(alts);};
   try{r.start();}catch(e){rej("start");}
 });}
 function stopListen(){try{listen.cur&&listen.cur.stop();}catch(e){}try{recordAudio.stop&&recordAudio.stop();}catch(e){}}
@@ -826,7 +846,7 @@ const WAVE='<span class="wave"><i></i><i></i><i></i><i></i></span>';
 function renderFeedback(c,r,lang){
   const p=$("#fbPanel");p.hidden=false;const lg=LANGS[lang]||LANGS.zh;
   const sc=r.score>=SET.target?"var(--good)":r.score>=50?"var(--warn)":"var(--bad)";
-  const msg=!r.heard?"Tidak terdengar apa-apa. Dekatkan mikrofon dan coba lagi.":r.score>=95?"Sempurna! Seperti penutur asli.":r.score>=SET.target?"Bagus, sudah lolos target.":r.score>=50?"Hampir. Perhatikan bagian yang berwarna.":"Belum tepat. Dengarkan lagi pelan-pelan, lalu tirukan.";
+  const msg=!r.heard?(IS_MOBILE?"Tidak terdengar apa-apa. Mulai bicara setelah muncul tulisan \u201cucapkan sekarang\u201d. Jika tetap begini, cek izin mikrofon Chrome (ikon di kiri alamat → Izin).":"Tidak terdengar apa-apa. Dekatkan mikrofon dan coba lagi."):r.score>=95?"Sempurna! Seperti penutur asli.":r.score>=SET.target?"Bagus, sudah lolos target.":r.score>=50?"Hampir. Perhatikan bagian yang berwarna.":"Belum tepat. Dengarkan lagi pelan-pelan, lalu tirukan.";
   const tones=r.res.filter(x=>x.k==="tone"),bads=r.res.filter(x=>x.k==="bad"||x.k==="miss");
   let detail="";
   if(lg.han&&(tones.length||bads.length)){
@@ -845,7 +865,7 @@ function renderFeedback(c,r,lang){
 /* ---------- practice engine ---------- */
 async function attempt(c,lang){
   if(!canListen()){showMicHelp();return null;}
-  st.micState="live";$("#micBtn").classList.add("live");setStatus(WAVE+" Giliranmu — ucapkan sekarang");
+  st.micState="live";$("#micBtn").classList.add("live");setStatus(SR?"Menyiapkan mikrofon…":WAVE+" Giliranmu, ucapkan sekarang");
   try{const alts=await listen(LANGS[lang].sr,t=>setStatus(WAVE+" "+esc(t)),lang);
     const r=bestOf(c.text,alts,lang);st.lastAttempt={id:c.id,r};
     if(r.heard)Store.patchCard&&!isExample()&&Store.patchCard(c.id,{best:Math.max(c.best||0,r.score),seen:(c.seen||0)+1});
