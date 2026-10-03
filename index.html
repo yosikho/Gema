@@ -626,9 +626,11 @@ function splitText(raw,mode){
 }
 /* duplicates: compare ignoring spaces and punctuation */
 const dupKey=t=>String(t||"").toLowerCase().normalize("NFKC").replace(/[\s\p{P}\p{S}]/gu,"");
-function findDups(items){const where=new Map();
-  for(const c of Store.cards){const k=dupKey(c.text);if(k&&!where.has(k))where.set(k,c);}
-  return items.map(t=>({t,hit:where.get(dupKey(t))||null}));}
+function findDups(items){const where=new Map();const all=[];
+  for(const c of Store.cards){const k=dupKey(c.text);if(!k)continue;if(!where.has(k))where.set(k,c);all.push([k,c]);}
+  return items.map(t=>{const k=dupKey(t);const hit=where.get(k)||null;let near=null;
+    if(!hit&&k.length>=1&&all.length){for(const [ck,c] of all){if((k.length>=1&&ck.includes(k))||(ck.length>=2&&k.includes(ck))){near=c;break;}}}
+    return {t,hit,near};});}
 function deckName(id){const d=Store.decks.find(x=>x.id===id);return d?d.name:"daftar lain";}
 function renderPasteInfo(){
   const box=$("#pasteInfo");const raw=$("#paste").value;if(!raw.trim()){box.hidden=true;return;}
@@ -636,6 +638,7 @@ function renderPasteInfo(){
   const cur=curDeck().id;
   box.hidden=false;
   box.innerHTML=`<span>Akan ditambahkan: <b>${items.length-dups.length}</b> item baru${items.length>=MAX_ITEMS?` (maksimal ${MAX_ITEMS} sekali tambah)`:""}${items.length===1&&items[0].length>60?` · ${items[0].length} karakter`:""}</span>`+
+    (()=>{const near=res.filter(x=>!x.hit&&x.near);return near.length?`<span class="dup">⚠ ${near.length} mirip dengan yang sudah ada (tetap ditambahkan):</span><ul>${near.slice(0,30).map(x=>`<li><span class="hz">${esc(x.t)}</span> <span class="muted">· ada di “<span class="hz">${esc(x.near.text)}</span>”${x.near.deck===cur?"":" ("+esc(deckName(x.near.deck))+")"}</span></li>`).join("")}</ul>`:"";})()+
     (dups.length?`<span class="dup">⚠ ${dups.length} sudah ada di daftar, akan dilewati:</span><ul>${dups.slice(0,30).map(x=>`<li><span class="hz">${esc(x.t)}</span> <span class="muted">· di ${x.hit.deck===cur?"daftar ini":"“"+esc(deckName(x.hit.deck))+"”"}</span></li>`).join("")}</ul>${dups.length>30?`<span class="muted">…dan ${dups.length-30} lagi</span>`:""}`:"");
 }
 
@@ -670,7 +673,8 @@ async function fillTranslations(cards,lang){
 const TTS={voices:[],init(){if(!("speechSynthesis" in window))return;const load=()=>{this.voices=speechSynthesis.getVoices();};load();speechSynthesis.onvoiceschanged=()=>{load();if($("#voiceSel"))fillVoiceSel();};},
   pick(tag){const pref=SET.voices[tag];const vs=this.voices.filter(v=>v.lang.replace("_","-").toLowerCase().startsWith(tag.toLowerCase().slice(0,2)));if(pref){const v=vs.find(v=>v.name===pref);if(v)return v;}
     const exact=vs.filter(v=>v.lang.replace("_","-").toLowerCase()===tag.toLowerCase());const pool=exact.length?exact:vs;return pool.find(v=>/google|natural|neural|premium|enhanced/i.test(v.name))||pool[0]||null;},
-  useDevice(tag){if(!("speechSynthesis" in window))return false;if(!inFrame&&SET.voiceSrc==="online")return false;if(!this.voices.length)return inFrame||SET.voiceSrc==="device";return !!this.pick(tag);},
+  broken:false,
+  useDevice(tag){if(!("speechSynthesis" in window))return false;if(!inFrame&&(SET.voiceSrc==="online"||SET.voiceSrc==="youdao"))return false;if(!inFrame&&this.broken&&SET.voiceSrc!=="device")return false;if(!this.voices.length)return inFrame||SET.voiceSrc==="device";return !!this.pick(tag);},
   speak(text,tag,rate,opts){
     if(!this.useDevice(tag)){
       if(!inFrame)return GTTS.speak(text,tag,rate);
@@ -678,22 +682,43 @@ const TTS={voices:[],init(){if(!("speechSynthesis" in window))return;const load=
       showTtsNote(("speechSynthesis" in window)?"lang":"none",true);return Promise.resolve(0);}
     speechSynthesis.cancel();const my=++this.tok;const t0=performance.now();const parts=text.length>120?GTTS.chunks(text):[text];
     const one=part=>new Promise(res=>{const u=new SpeechSynthesisUtterance(part);u.lang=tag;u.rate=rate;const v=this.pick(tag);if(v)u.voice=v;
-      let done=false;const fin=()=>{if(done)return;done=true;clearTimeout(guard);res();};const guard=setTimeout(fin,1500+part.length*450/rate);u.onend=fin;u.onerror=fin;speechSynthesis.speak(u);});
-    return (async()=>{for(const p of parts){if(my!==this.tok)break;await one(p);}return performance.now()-t0;})();},
+      let done=false,started=false;const fin=ok=>{if(done)return;done=true;clearTimeout(guard);clearTimeout(probe);res(ok);};
+      const guard=setTimeout(()=>fin(started),1500+part.length*450/rate);
+      const probe=setTimeout(()=>{if(!started&&!inFrame){try{speechSynthesis.cancel();}catch(e){}fin(false);}},2500);
+      u.onstart=()=>{started=true;};u.onend=()=>fin(started||true);u.onerror=()=>fin(false);speechSynthesis.speak(u);});
+    return (async()=>{for(const p of parts){if(my!==this.tok)break;const ok=await one(p);
+        if(!ok&&!inFrame&&my===this.tok&&SET.voiceSrc!=="device"){this.broken=true;await GTTS.speak(parts.slice(parts.indexOf(p)).join(""),tag,rate);break;}}
+      return performance.now()-t0;})();},
   tok:0,stop(){this.tok++;try{speechSynthesis.cancel();}catch(e){}GTTS.stop();}};
 /* online voice (standalone file only; the artifact frame blocks outside audio) */
-const GTTS={cur:null,tok:0,warned:false,
+/* Online voices. One shared <audio> element, unlocked on the first tap, so browsers that
+   only allow sound right after a tap (some tablet browsers) still play the later sentences. */
+const SILENT=(()=>{try{const n=800,buf=new ArrayBuffer(44+n*2),v=new DataView(buf);const w=(o,t)=>{for(let i=0;i<t.length;i++)v.setUint8(o+i,t.charCodeAt(i));};
+  w(0,"RIFF");v.setUint32(4,36+n*2,true);w(8,"WAVE");w(12,"fmt ");v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);v.setUint32(24,8000,true);v.setUint32(28,16000,true);v.setUint16(32,2,true);v.setUint16(34,16,true);w(36,"data");v.setUint32(40,n*2,true);
+  return URL.createObjectURL(new Blob([buf],{type:"audio/wav"}));}catch(e){return "";}})();
+const GTTS={cur:null,tok:0,warned:false,el:null,unlocked:false,lastErr:"",
   tl(tag){const t=tag.toLowerCase();if(t.startsWith("zh"))return t==="zh-tw"?"zh-TW":"zh-CN";return t.slice(0,2);},
+  yd(tag){const t=tag.toLowerCase().slice(0,2);return {zh:"zh",ja:"jap",ko:"ko",fr:"fr",en:"eng"}[t]||null;},
+  urls(ch,tag){const g=`https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=${this.tl(tag)}&q=${encodeURIComponent(ch)}`;
+    const le=this.yd(tag);const y=le?`https://dict.youdao.com/dictvoice?le=${le}&audio=${encodeURIComponent(ch)}`:null;
+    const order=SET.voiceSrc==="youdao"?[y,g]:[g,y];return order.filter(Boolean);},
+  audio(){if(!this.el){this.el=new Audio();this.el.preload="auto";}return this.el;},
+  unlock(){if(this.unlocked||!SILENT||this.cur)return;this.unlocked=true;try{const a=this.audio();a.src=SILENT;const p=a.play();if(p&&p.catch)p.catch(()=>{this.unlocked=false;});}catch(e){this.unlocked=false;}},
   chunks(text){const out=[];let buf="";for(const part of text.match(/[^。！？!?，,；;.、]+[。！？!?，,；;.、]*|[。！？!?，,；;.、]+/g)||[text]){if((buf+part).length>180&&buf){out.push(buf);buf="";}buf+=part;}if(buf)out.push(buf);return out.flatMap(c=>c.length>190?c.match(/.{1,190}/gu):[c]);},
+  playUrl(url,rate,maxMs){return new Promise(res=>{const a=this.audio();this.cur=a;let started=false,done=false;
+    const fin=(ok,err)=>{if(done)return;done=true;clearTimeout(g);a.onended=a.onerror=a.onplaying=null;res({ok,err,started});};
+    const g=setTimeout(()=>fin(started,started?"":"timeout"),maxMs);
+    a.onplaying=()=>{started=true;};a.onended=()=>fin(true,"");a.onerror=()=>fin(false,"load");
+    try{a.src=url;a.playbackRate=Math.max(.5,Math.min(2,rate));a.preservesPitch=true;const p=a.play();if(p&&p.catch)p.catch(e=>fin(false,e&&e.name==="NotAllowedError"?"blocked":"play"));}catch(e){fin(false,"play");}});},
   async speak(text,tag,rate){const my=++this.tok;const t0=performance.now();
-    for(const ch of this.chunks(text)){if(my!==this.tok)break;
-      await new Promise(res=>{const a=new Audio(`https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=${this.tl(tag)}&q=${encodeURIComponent(ch)}`);
-        a.playbackRate=Math.max(.5,Math.min(2,rate));a.preservesPitch=true;this.cur=a;
-        const g=setTimeout(res,5000+ch.length*500/rate);const end=()=>{clearTimeout(g);res();};
-        a.onended=end;a.onerror=()=>{if(!this.warned){this.warned=true;toast("Suara online gagal dimuat. Periksa koneksi internet.",3500);}end();};
-        a.play().catch(()=>end());});}
+    for(const ch of this.chunks(text)){if(my!==this.tok)break;let r={ok:false,err:""};
+      for(const url of this.urls(ch,tag)){if(my!==this.tok)break;r=await this.playUrl(url,rate,8000+ch.length*500/rate);if(r.ok||r.started||r.err==="blocked")break;}
+      if(!r.ok&&!r.started&&my===this.tok){this.lastErr=r.err;if(!this.warned){this.warned=true;
+        toast(r.err==="blocked"?"Browser menahan suara. Ketuk tombol 🔊 sekali, lalu coba lagi.":"Suara online gagal diputar. Buka ⚙️ Pengaturan → Tes suara.",4500);}break;}}
     this.cur=null;return performance.now()-t0;},
   stop(){this.tok++;try{this.cur&&this.cur.pause();}catch(e){}this.cur=null;}};
+document.addEventListener("pointerdown",()=>GTTS.unlock(),{capture:true});
+document.addEventListener("keydown",()=>GTTS.unlock(),{capture:true});
 
 
 const ART_URL="https://claude.ai/artifact/9WkJJhFeyeZgGT2HdenQJM";
@@ -1189,7 +1214,8 @@ function settingsSheet(){
   openSheet(`<h2>Pengaturan</h2>
     <div class="field"><label class="lbl" for="voiceSel">Suara penutur (${esc(L().name)})</label><select id="voiceSel"></select>
       <span class="small muted">Suara berasal dari perangkatmu. Suara "Google" atau "Natural" biasanya paling mirip penutur asli.</span></div>
-    ${inFrame?"":`<div class="field"><label class="lbl" for="srcSel">Sumber suara</label><select id="srcSel"><option value="auto" ${SET.voiceSrc==="auto"?"selected":""}>Otomatis</option><option value="device" ${SET.voiceSrc==="device"?"selected":""}>Suara perangkat</option><option value="online" ${SET.voiceSrc==="online"?"selected":""}>Suara Google online</option></select><span class="small muted">Pilih "Suara Google online" jika perangkat tidak bersuara (mis. tablet Huawei).</span></div>`}
+    ${inFrame?"":`<div class="field"><label class="lbl" for="srcSel">Sumber suara</label><select id="srcSel"><option value="auto" ${SET.voiceSrc==="auto"?"selected":""}>Otomatis</option><option value="device" ${SET.voiceSrc==="device"?"selected":""}>Suara perangkat</option><option value="online" ${SET.voiceSrc==="online"?"selected":""}>Suara Google online</option><option value="youdao" ${SET.voiceSrc==="youdao"?"selected":""}>Suara Youdao online (Mandarin)</option></select><span class="small muted">Tidak ada suara? Ketuk <b>Tes suara</b>, lalu pilih sumber yang terdengar.</span>
+      <div class="btnrow"><button class="btn sm" id="sndTest">Tes suara</button></div><div class="tips small" id="sndOut" hidden></div></div>`}
     <div class="btnrow"><button class="btn sm" id="voiceTest">Coba suara</button></div>
     <div class="field"><label class="lbl" for="tgtSel">Terjemahkan ke</label><select id="tgtSel">${Object.entries(TARGETS).map(([k,v])=>`<option value="${k}" ${k===SET.targetLang?"selected":""}>${v}</option>`).join("")}</select></div>
     ${isExample()?"":`<div class="field"><label class="lbl" for="dName">Nama daftar ini</label><input type="text" id="dName" value="${esc(d.name)}"></div>
@@ -1204,9 +1230,19 @@ function settingsSheet(){
     <div class="field"><span class="lbl">Cadangan</span><span class="small muted">${Store.mode==="db"?"Daftarmu tersimpan di akun Claude-mu (pribadi).":Store.mode==="file"?`Daftarmu otomatis tersimpan di file <b>${esc(Store.filePath||"gema-data.json")}</b>, dengan cadangan harian di folder <b>cadangan</b>.`:"Daftarmu tersimpan di browser ini saja."} Salin cadangan untuk memindahkan ke perangkat lain.</span>
       <div class="btnrow"><button class="btn sm" id="bkCopy">Salin cadangan</button><button class="btn sm" id="bkImp">Impor cadangan</button><label class="btn sm" for="bkFile">Impor dari file</label><input type="file" id="bkFile" accept=".json,.txt,application/json,text/plain" hidden></div>
       <textarea id="bkText" hidden placeholder="Tempel teks cadangan di sini"></textarea><button class="btn sm" id="bkGo" hidden>Impor sekarang</button></div>
+    <div class="small muted">Versi Gema: 3 Okt 2026 · v16</div>
     <div class="btnrow"><button class="btn primary" id="setOk">Selesai</button>${isExample()?"":`<button class="btn ghost" id="dDel" style="color:var(--bad)">Hapus daftar ini</button>`}</div>`,s=>{
     fillVoiceSel();
-    const srcSel=s.querySelector("#srcSel");if(srcSel)srcSel.onchange=()=>{SET.voiceSrc=srcSel.value;saveSet();};
+    const srcSel=s.querySelector("#srcSel");if(srcSel)srcSel.onchange=()=>{SET.voiceSrc=srcSel.value;TTS.broken=false;saveSet();};
+    const sndTest=s.querySelector("#sndTest");if(sndTest)sndTest.onclick=()=>{GTTS.unlock();const out=s.querySelector("#sndOut");out.hidden=false;const tag=L().tts;
+      const zh=TTS.voices.filter(v=>v.lang.replace("_","-").toLowerCase().startsWith(tag.toLowerCase().slice(0,2)));
+      out.innerHTML=`<div>Suara perangkat: ${("speechSynthesis" in window)?`ada, ${TTS.voices.length} suara (${zh.length} untuk ${esc(L().name)})`:"tidak tersedia di browser ini"}</div>
+        <div class="btnrow" style="margin-top:6px"><button class="btn sm" data-t="device">Coba perangkat</button><button class="btn sm" data-t="online">Coba Google</button>${GTTS.yd(tag)?`<button class="btn sm" data-t="youdao">Coba Youdao</button>`:""}</div><div id="sndRes" style="margin-top:6px"></div>`;
+      out.onclick=async e=>{const b=e.target.closest("[data-t]");if(!b)return;const t=b.dataset.t;const res=out.querySelector("#sndRes");const sample=tag.startsWith("zh")?"你好，我们一起学习中文。":(curCards()[0]||{}).text||"Hello";
+        res.textContent="Memutar…";
+        if(t==="device"){if(!("speechSynthesis" in window)){res.textContent="Browser ini tidak punya suara perangkat.";return;}const prev=SET.voiceSrc;SET.voiceSrc="device";TTS.broken=false;await TTS.speak(sample,tag,SET.rate);SET.voiceSrc=prev;res.innerHTML=`Terdengar? Jika ya, pilih <b>Suara perangkat</b> di atas.`;return;}
+        const prev=SET.voiceSrc;SET.voiceSrc=t;const url=GTTS.urls(sample,tag)[0];SET.voiceSrc=prev;const r=await GTTS.playUrl(url,SET.rate,12000);
+        res.innerHTML=r.ok||r.started?`Berhasil diputar. Terdengar? Jika ya, pilih <b>${t==="youdao"?"Suara Youdao online":"Suara Google online"}</b> di atas.`:`Gagal (${r.err==="blocked"?"ditahan browser, ketuk sekali lagi":r.err==="load"?"tidak bisa dimuat dari jaringan ini":"tidak ada respons"}).`;};};
     s.querySelector("#voiceTest").onclick=()=>{const sel=s.querySelector("#voiceSel");SET.voices[L().tts]=sel.value;saveSet();const c=curCards()[0];TTS.speak(c?c.text:"你好",L().tts,SET.rate);};
     s.querySelector("#bkCopy").onclick=async()=>{const data=JSON.stringify({gema:1,decks:Store.decks,cards:Store.cards});try{await navigator.clipboard.writeText(data);toast("Cadangan disalin");}catch(e){const t=s.querySelector("#bkText");t.hidden=false;t.value=data;t.select();toast("Salin teks yang tersorot");}};
     const syGo=s.querySelector("#syGo");if(syGo)syGo.onclick=async()=>{const t=s.querySelector("#syTok").value.trim();if(!t){toast("Tempel kode aksesnya dulu");return;}
@@ -1226,7 +1262,15 @@ function settingsSheet(){
 /* ---------- actions ---------- */
 async function addFromPaste(autoTranslate,force){
   const raw=$("#paste").value;const items=splitText(raw,$("#splitMode").value);if(!items.length){toast("Tempel teks dulu");return;}
-  const res=findDups(items);const dups=res.filter(x=>x.hit);
+  const res=findDups(items);const dups=res.filter(x=>x.hit);const near=res.filter(x=>!x.hit&&x.near);
+  if(!dups.length&&near.length&&!force){const cur=curDeck().id;
+    openSheet(`<h2>Mirip dengan yang sudah ada</h2>
+      <p class="small" style="margin:0">${near.length} item mirip atau sudah terkandung di daftar:</p>
+      <ul class="small" style="margin:0;padding-left:18px;max-height:40vh;overflow:auto">${near.slice(0,50).map(x=>`<li><span class="hz" style="font-size:16px">${esc(x.t)}</span> <span class="muted">· ada di “<span class="hz">${esc(x.near.text)}</span>”${x.near.deck===cur?"":" ("+esc(deckName(x.near.deck))+")"}</span></li>`).join("")}</ul>
+      <div class="btnrow"><button class="btn primary" id="nearAdd">Tetap tambahkan</button><button class="btn ghost" id="nearNo">Batal</button></div>`,sh=>{
+      sh.querySelector("#nearNo").onclick=closeSheet;sh.querySelector("#nearAdd").onclick=()=>{closeSheet();addItems(items,autoTranslate,raw);};});
+    return;
+  }
   if(dups.length&&!force){
     const fresh=items.length-dups.length;const cur=curDeck().id;
     openSheet(`<h2>Sudah ada di daftar</h2>
