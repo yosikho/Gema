@@ -474,13 +474,57 @@ const isHan=ch=>/\p{Script=Han}/u.test(ch);
 const SET=Object.assign({rate:0.9,repeats:2,gap:1,target:80,showRead:true,showMean:true,loop:false,targetLang:"id",voices:{},mode:"listen",deck:null,voiceSrc:"auto",withMeaning:false},lsGet("gema.settings",{}));
 const saveSet=()=>lsSet("gema.settings",SET);
 
+/* ---------- sync between devices through a secret GitHub gist (web & laptop versions) ---------- */
+function mergeData(a,b){
+  const del={...(a.deleted||{})};for(const [k,v] of Object.entries(b.deleted||{}))del[k]=Math.max(del[k]||0,v);
+  const pick=(xs,ys)=>{const m=new Map();for(const x of [...(xs||[]),...(ys||[])]){const o=m.get(x.id);if(!o||(x.updated||0)>(o.updated||0))m.set(x.id,x);}
+    return [...m.values()].filter(x=>!(del[x.id]&&del[x.id]>=(x.updated||0)));};
+  return {decks:pick(a.decks,b.decks),cards:pick(a.cards,b.cards),deleted:del};
+}
+function dataSig(d){const k=x=>[...(x||[])].sort((p,q)=>p.id<q.id?-1:1).map(o=>o.id+":"+(o.updated||0));return JSON.stringify([k(d.decks),k(d.cards),Object.keys(d.deleted||{}).length]);}
+const SYNC_FILE="gema-data.json";
+const Sync={cfg:lsGet("gema.sync",null),busy:false,again:false,timer:null,applying:false,last:0,err:"",
+  get on(){return !inFrame&&!!(this.cfg&&this.cfg.token&&this.cfg.gist);},
+  async api(path,opt={},token){const r=await fetch("https://api.github.com"+path,{method:opt.method||"GET",cache:"no-store",body:opt.body,
+      headers:{Authorization:"Bearer "+(token||this.cfg.token),Accept:"application/vnd.github+json",...(opt.body?{"Content-Type":"application/json"}:{})}});
+    if(!r.ok)throw {status:r.status};return r.json();},
+  local(){return {decks:Store.decks,cards:Store.cards,deleted:Store.deleted};},
+  body(d){return JSON.stringify({files:{[SYNC_FILE]:{content:JSON.stringify({gema:1,saved:new Date().toISOString(),...d},null,0)}}});},
+  async connect(token){
+    const me=await this.api("/user",{},token);
+    let gist=null;
+    for(let page=1;page<=5&&!gist;page++){const list=await this.api(`/gists?per_page=100&page=${page}`,{},token);if(!list.length)break;gist=list.find(g=>g.files&&g.files[SYNC_FILE]&&/Gema/.test(g.description||""));}
+    if(!gist)gist=await this.api("/gists",{method:"POST",body:JSON.stringify({description:"Gema: daftar belajar (dibuat otomatis oleh aplikasi Gema)",public:false,files:JSON.parse(this.body(this.local())).files})},token);
+    this.cfg={token,gist:gist.id,login:me.login};lsSet("gema.sync",this.cfg);
+    await this.now(true);return me.login;},
+  disconnect(){this.cfg=null;lsSet("gema.sync",null);},
+  async pull(){const g=await this.api(`/gists/${this.cfg.gist}`);const f=g.files&&g.files[SYNC_FILE];if(!f)return {decks:[],cards:[],deleted:{}};
+    const txt=f.truncated?await (await fetch(f.raw_url,{cache:"no-store"})).text():f.content;try{return JSON.parse(txt);}catch(e){return {decks:[],cards:[],deleted:{}};}},
+  schedule(ms=1500){if(!this.on)return;clearTimeout(this.timer);this.timer=setTimeout(()=>this.now(),ms);},
+  async now(loud){
+    if(!this.on)return;if(this.busy){this.again=true;return;}this.busy=true;
+    try{const remote=await this.pull();const loc=this.local();const merged=mergeData(loc,remote);
+      if(dataSig(merged)!==dataSig(loc)){this.applying=true;Store.decks=merged.decks;Store.cards=merged.cards;Store.deleted=merged.deleted;Store.saveLocal();this.applying=false;onData();}
+      if(dataSig(merged)!==dataSig(remote))await this.api(`/gists/${this.cfg.gist}`,{method:"PATCH",body:this.body(merged)});
+      this.last=Date.now();this.err="";if(loud)toast("Daftar tersinkron");}
+    catch(e){this.applying=false;const st=e&&e.status;this.err=st===401?"Kode akses ditolak atau sudah kedaluwarsa. Hubungkan ulang.":st===404?"File sinkron tidak ditemukan. Hubungkan ulang.":"Belum bisa sinkron (cek internet).";
+      if(loud||st===401||st===404)toast(this.err,4000);}
+    finally{this.busy=false;const s=$("#syncState");if(s)s.textContent=syncStateText();if(this.again){this.again=false;this.schedule(800);}}
+  }
+};
+function syncStateText(){if(!Sync.on)return "";if(Sync.err)return Sync.err;if(!Sync.last)return "Menyinkronkan…";return "Terakhir sinkron "+new Date(Sync.last).toLocaleTimeString("id-ID",{hour:"2-digit",minute:"2-digit"});}
+document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible")Sync.schedule(300);});
+setInterval(()=>{if(document.visibilityState==="visible")Sync.schedule(0);},90000);
+
 /* ---------- storage: private db when available, else this browser ---------- */
 const Store={mode:"local",decks:[],cards:[],col:null,
-  loadLocal(){const d=lsGet("gema.data",{decks:[],cards:[]});this.decks=d.decks||[];this.cards=d.cards||[];},
-  saveLocal(){if(this.mode==="local"||this.mode==="file")lsSet("gema.data",{decks:this.decks,cards:this.cards});if(this.mode==="file")this.pushFile();},
+  deleted:{},
+  loadLocal(){const d=lsGet("gema.data",{decks:[],cards:[]});this.decks=d.decks||[];this.cards=d.cards||[];this.deleted=d.deleted||{};},
+  saveLocal(){if(this.mode==="local"||this.mode==="file")lsSet("gema.data",{decks:this.decks,cards:this.cards,deleted:this.deleted});if(this.mode==="file")this.pushFile();if(!Sync.applying)Sync.schedule();},
+  tomb(ids){const t=Date.now();ids.forEach(id=>{this.deleted[id]=t;});},
   /* laptop version: Buka Gema.bat serves /api/data and keeps gema-data.json next to the page */
   filePath:"",fileFail:false,pushT:null,
-  payload(){return JSON.stringify({gema:1,saved:new Date().toISOString(),decks:this.decks,cards:this.cards});},
+  payload(){return JSON.stringify({gema:1,saved:new Date().toISOString(),decks:this.decks,cards:this.cards,deleted:this.deleted});},
   pushFile(){clearTimeout(this.pushT);this.pushT=setTimeout(async()=>{
     try{const r=await fetch("/api/data",{method:"POST",headers:{"Content-Type":"application/json"},body:this.payload()});if(!r.ok)throw 0;
       if(this.fileFail){this.fileFail=false;toast("Tersimpan lagi ke file");}}
@@ -488,7 +532,7 @@ const Store={mode:"local",decks:[],cards:[],col:null,
   async initFile(){
     try{const r=await fetch("/api/data",{cache:"no-store"});try{this.filePath=decodeURIComponent(r.headers.get("X-Gema-Path")||"");}catch(e){this.filePath="";}
       if(r.status===404||r.ok){this.mode="file";}else return false;
-      if(r.ok){const j=await r.json();this.decks=j.decks||[];this.cards=j.cards||[];lsSet("gema.data",{decks:this.decks,cards:this.cards});}
+      if(r.ok){const j=await r.json();this.decks=j.decks||[];this.cards=j.cards||[];this.deleted=j.deleted||{};lsSet("gema.data",{decks:this.decks,cards:this.cards,deleted:this.deleted});}
       else if(this.decks.length)this.pushFile();
       addEventListener("pagehide",()=>{if(this.pushT){clearTimeout(this.pushT);try{navigator.sendBeacon("/api/data",new Blob([this.payload()],{type:"application/json"}));}catch(e){}}});
       return true;}catch(e){return false;}
@@ -515,13 +559,13 @@ const Store={mode:"local",decks:[],cards:[],col:null,
       },()=>{});
     }catch(e){this.mode="local";}
   },
-  async putDeck(d){const i=this.decks.findIndex(x=>x.id===d.id);if(i<0)this.decks.push(d);else this.decks[i]=d;this.saveLocal();onData();if(this.col)try{await this.col.doc("d_"+d.id).set({kind:"deck",...d});}catch(e){toast("Gagal menyimpan, coba lagi");}},
-  async putCard(c){const i=this.cards.findIndex(x=>x.id===c.id);if(i<0)this.cards.push(c);else this.cards[i]=c;this.saveLocal();onData();if(this.col)try{await this.col.doc("c_"+c.id).set({kind:"card",...c});}catch(e){toast("Gagal menyimpan, coba lagi");}},
-  async patchCard(id,patch){const c=this.cards.find(x=>x.id===id);if(!c)return;Object.assign(c,patch);this.saveLocal();onData();if(this.col)try{await this.col.doc("c_"+id).update(patch);}catch(e){}},
-  async reorder(ids){const changed=[];ids.forEach((id,i)=>{const c=this.cards.find(x=>x.id===id);if(c&&c.order!==i){c.order=i;changed.push(c);}});if(!changed.length)return;this.saveLocal();onData();
+  async putDeck(d){d.updated=Date.now();const i=this.decks.findIndex(x=>x.id===d.id);if(i<0)this.decks.push(d);else this.decks[i]=d;this.saveLocal();onData();if(this.col)try{await this.col.doc("d_"+d.id).set({kind:"deck",...d});}catch(e){toast("Gagal menyimpan, coba lagi");}},
+  async putCard(c){c.updated=Date.now();const i=this.cards.findIndex(x=>x.id===c.id);if(i<0)this.cards.push(c);else this.cards[i]=c;this.saveLocal();onData();if(this.col)try{await this.col.doc("c_"+c.id).set({kind:"card",...c});}catch(e){toast("Gagal menyimpan, coba lagi");}},
+  async patchCard(id,patch){const c=this.cards.find(x=>x.id===id);if(!c)return;patch.updated=Date.now();Object.assign(c,patch);this.saveLocal();onData();if(this.col)try{await this.col.doc("c_"+id).update(patch);}catch(e){}},
+  async reorder(ids){const changed=[];ids.forEach((id,i)=>{const c=this.cards.find(x=>x.id===id);if(c&&c.order!==i){c.order=i;c.updated=Date.now();changed.push(c);}});if(!changed.length)return;this.saveLocal();onData();
     if(this.col){for(const c of changed){try{await this.col.doc("c_"+c.id).update({order:c.order});}catch(e){}}}},
-  async delCard(id){this.cards=this.cards.filter(x=>x.id!==id);this.saveLocal();onData();if(this.col)try{await this.col.doc("c_"+id).delete();}catch(e){}},
-  async delDeck(id){const cs=this.cards.filter(c=>c.deck===id);this.decks=this.decks.filter(d=>d.id!==id);this.cards=this.cards.filter(c=>c.deck!==id);this.saveLocal();onData();if(this.col){try{for(const c of cs)await this.col.doc("c_"+c.id).delete();await this.col.doc("d_"+id).delete();}catch(e){}}}
+  async delCard(id){this.tomb([id]);this.cards=this.cards.filter(x=>x.id!==id);this.saveLocal();onData();if(this.col)try{await this.col.doc("c_"+id).delete();}catch(e){}},
+  async delDeck(id){const cs=this.cards.filter(c=>c.deck===id);this.tomb([id,...cs.map(c=>c.id)]);this.decks=this.decks.filter(d=>d.id!==id);this.cards=this.cards.filter(c=>c.deck!==id);this.saveLocal();onData();if(this.col){try{for(const c of cs)await this.col.doc("c_"+c.id).delete();await this.col.doc("d_"+id).delete();}catch(e){}}}
 };
 
 /* ---------- state ---------- */
@@ -1095,6 +1139,13 @@ function settingsSheet(){
     <div class="field"><label class="lbl" for="tgtSel">Terjemahkan ke</label><select id="tgtSel">${Object.entries(TARGETS).map(([k,v])=>`<option value="${k}" ${k===SET.targetLang?"selected":""}>${v}</option>`).join("")}</select></div>
     ${isExample()?"":`<div class="field"><label class="lbl" for="dName">Nama daftar ini</label><input type="text" id="dName" value="${esc(d.name)}"></div>
     <div class="field"><label class="lbl" for="dLang">Bahasa daftar ini</label><select id="dLang">${langOptions(d.lang)}</select></div>`}
+    ${inFrame?"":`<div class="field"><span class="lbl">Sinkron laptop &amp; HP</span>${Sync.on?`<span class="small">Tersambung ke GitHub <b>@${esc(Sync.cfg.login||"")}</b>. Daftarmu otomatis sama di semua perangkat yang tersambung. <span class="muted" id="syncState">${esc(syncStateText())}</span></span>
+      <div class="btnrow"><button class="btn sm" id="syNow">Sinkronkan sekarang</button><button class="btn sm ghost" id="syOff">Putuskan di perangkat ini</button></div>`
+      :`<span class="small muted">Simpan daftar di akun GitHub-mu supaya otomatis sama di laptop dan HP. Lakukan sekali di tiap perangkat:</span>
+      <ol class="small" style="margin:0;padding-left:20px"><li>Ketuk <b>Buat kode akses</b>, login GitHub, lalu di halaman itu klik tombol hijau <b>Generate token</b> di paling bawah. Izin "gist" sudah tercentang otomatis.</li><li>Salin kode yang muncul (diawali <b>ghp_</b>) dan tempel di bawah, lalu ketuk <b>Hubungkan</b>.</li></ol>
+      <div class="btnrow"><a class="btn sm" href="https://github.com/settings/tokens/new?scopes=gist&amp;description=Gema%20sinkron" target="_blank" rel="noopener">Buat kode akses</a></div>
+      <input type="password" id="syTok" placeholder="Tempel kode akses (ghp_…)" autocomplete="off" aria-label="Kode akses GitHub">
+      <div class="btnrow"><button class="btn sm primary" id="syGo">Hubungkan</button></div>`}</div>`}
     <div class="field"><span class="lbl">Cadangan</span><span class="small muted">${Store.mode==="db"?"Daftarmu tersimpan di akun Claude-mu (pribadi).":Store.mode==="file"?`Daftarmu otomatis tersimpan di file <b>${esc(Store.filePath||"gema-data.json")}</b>, dengan cadangan harian di folder <b>cadangan</b>.`:"Daftarmu tersimpan di browser ini saja."} Salin cadangan untuk memindahkan ke perangkat lain.</span>
       <div class="btnrow"><button class="btn sm" id="bkCopy">Salin cadangan</button><button class="btn sm" id="bkImp">Impor cadangan</button><label class="btn sm" for="bkFile">Impor dari file</label><input type="file" id="bkFile" accept=".json,.txt,application/json,text/plain" hidden></div>
       <textarea id="bkText" hidden placeholder="Tempel teks cadangan di sini"></textarea><button class="btn sm" id="bkGo" hidden>Impor sekarang</button></div>
@@ -1103,6 +1154,11 @@ function settingsSheet(){
     const srcSel=s.querySelector("#srcSel");if(srcSel)srcSel.onchange=()=>{SET.voiceSrc=srcSel.value;saveSet();};
     s.querySelector("#voiceTest").onclick=()=>{const sel=s.querySelector("#voiceSel");SET.voices[L().tts]=sel.value;saveSet();const c=curCards()[0];TTS.speak(c?c.text:"你好",L().tts,SET.rate);};
     s.querySelector("#bkCopy").onclick=async()=>{const data=JSON.stringify({gema:1,decks:Store.decks,cards:Store.cards});try{await navigator.clipboard.writeText(data);toast("Cadangan disalin");}catch(e){const t=s.querySelector("#bkText");t.hidden=false;t.value=data;t.select();toast("Salin teks yang tersorot");}};
+    const syGo=s.querySelector("#syGo");if(syGo)syGo.onclick=async()=>{const t=s.querySelector("#syTok").value.trim();if(!t){toast("Tempel kode aksesnya dulu");return;}
+      syGo.disabled=true;syGo.textContent="Menghubungkan…";try{const who=await Sync.connect(t);closeSheet();toast("Tersambung sebagai @"+who+". Daftar disinkronkan.",3500);}
+      catch(e){syGo.disabled=false;syGo.textContent="Hubungkan";toast(e&&e.status===401?"Kode akses tidak valid. Periksa lagi, harus diawali ghp_.":e&&e.status===403?"Kode akses tidak punya izin gist. Buat ulang dengan tombol Buat kode akses.":"Gagal terhubung. Periksa internet lalu coba lagi.",4500);}};
+    const syNow=s.querySelector("#syNow");if(syNow)syNow.onclick=()=>Sync.now(true);
+    const syOff=s.querySelector("#syOff");if(syOff)syOff.onclick=()=>{if(syOff.dataset.sure){Sync.disconnect();closeSheet();toast("Sinkron diputus di perangkat ini. Daftar tetap ada.");}else{syOff.dataset.sure=1;syOff.textContent="Ketuk lagi untuk memutus";}};
     s.querySelector("#bkFile").onchange=async e=>{const f=e.target.files[0];if(!f)return;const t=s.querySelector("#bkText");t.hidden=false;t.value=await f.text();s.querySelector("#bkGo").click();};
     s.querySelector("#bkImp").onclick=()=>{s.querySelector("#bkText").hidden=false;s.querySelector("#bkText").value="";s.querySelector("#bkGo").hidden=false;};
     s.querySelector("#bkGo").onclick=async()=>{try{const j=JSON.parse(s.querySelector("#bkText").value);if(!j.decks)throw 0;for(const dd of j.decks)if(!Store.decks.find(x=>x.id===dd.id))await Store.putDeck(dd);for(const c of j.cards||[])if(!Store.cards.find(x=>x.id===c.id))await Store.putCard(c);closeSheet();toast("Cadangan diimpor");}catch(e){toast("Teks cadangan tidak dikenali");}};
@@ -1216,7 +1272,7 @@ document.addEventListener("keydown",e=>{if(e.key==="Escape")closeSheet();});
 /* ---------- boot ---------- */
 TTS.init();
 if(inFrame&&!("speechSynthesis" in window))showTtsNote("none");
-Store.loadLocal();onData();
+Store.loadLocal();onData();if(Sync.on)Sync.schedule(1200);
 Store.init().then(onData);
 })();
 </script>
